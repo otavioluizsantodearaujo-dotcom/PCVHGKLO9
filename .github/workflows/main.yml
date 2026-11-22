@@ -1,0 +1,141 @@
+name: AnyDesk-VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      segundos:
+        description: "Tempo ativo para outros usuarios (segundos)"
+        default: "2000"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  vm:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Criar usuario com senha aleatoria
+        shell: pwsh
+        run: |
+          $up  = [char[]]'ABCDEFGHJKLMNPQRSTUVWXYZ'
+          $low = [char[]]'abcdefghijkmnopqrstuvwxyz'
+          $num = [char[]]'23456789'
+          $sp  = [char[]]'@#_-'
+          $all = $up + $low + $num + $sp
+          $p   = @()
+          $p  += $up  | Get-Random -Count 3
+          $p  += $low | Get-Random -Count 3
+          $p  += $num | Get-Random -Count 3
+          $p  += $sp  | Get-Random -Count 2
+          $p  += $all | Get-Random -Count 5
+          $password = -join ($p | Sort-Object { Get-Random })
+
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "Skyro" -Password $secure -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "Skyro"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Skyro"
+          "VM_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Instalar AnyDesk
+        shell: pwsh
+        run: |
+          $exe = "$env:TEMP\AnyDesk.exe"
+          Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $exe
+          Start-Process $exe -ArgumentList '--install "C:\AnyDesk" --start-with-win --silent' -Wait
+          Start-Sleep -Seconds 10
+          Start-Service -Name "AnyDesk" -ErrorAction SilentlyContinue
+          Start-Process "C:\AnyDesk\AnyDesk.exe"
+          Start-Sleep -Seconds 10
+
+      - name: Definir senha e pegar ID
+        shell: pwsh
+        run: |
+          $ad = "C:\AnyDesk\AnyDesk.exe"
+
+          cmd /c "echo $env:VM_PASS| `"$ad`" --set-password _unattended_access"
+          Start-Sleep -Seconds 5
+
+          $id = $null
+          for ($i = 0; $i -lt 12; $i++) {
+              $out = (cmd /c "`"$ad`" --get-id | more") | Out-String
+              $out = $out.Trim()
+              if ($out -match '^\d{6,}$') { $id = $out; break }
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $id) { Write-Error "Nao foi possivel obter o ID do AnyDesk"; exit 1 }
+          "ANYDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Manter VM ativa
+        shell: pwsh
+        env:
+          DONO: "otavioluizsantodearaujo-dotcom"
+          ATOR: "${{ github.actor }}"
+          SEGUNDOS: "${{ github.event.inputs.segundos }}"
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          REPO: "${{ github.repository }}"
+          BRANCH: "${{ github.ref_name }}"
+        run: |
+          $atorLower = $env:ATOR.ToLower().Trim()
+          $donoLower = $env:DONO.ToLower().Trim()
+
+          Write-Host ""
+          Write-Host "========= ACESSO ANYDESK ========="
+          Write-Host "ID:       $env:ANYDESK_ID"
+          Write-Host "Senha:    $env:VM_PASS"
+          Write-Host "Usuario:  Skyro (Windows)"
+          Write-Host "=================================="
+          Write-Host "Actor detectado: $atorLower"
+          Write-Host ""
+
+          if ($atorLower -eq $donoLower) {
+              Write-Host ">>> DONO CONFIRMADO - Modo permanente ativado <<<"
+              Write-Host ""
+
+              # Roda por 5h20m e depois se reinicia sozinho
+              $fim = (Get-Date).AddMinutes(320)
+              while ((Get-Date) -lt $fim) {
+                  Write-Host "[$(Get-Date -Format T)] VM permanente | ID: $env:ANYDESK_ID | Reinicio em: $([int]($fim - (Get-Date)).TotalMinutes) min"
+                  Start-Sleep -Seconds 60
+              }
+
+              Write-Host ""
+              Write-Host ">>> Reiniciando workflow automaticamente... <<<"
+
+              $headers = @{
+                  "Authorization"        = "Bearer $env:GH_TOKEN"
+                  "Accept"               = "application/vnd.github+json"
+                  "X-GitHub-Api-Version" = "2022-11-28"
+              }
+              $body = @{
+                  ref    = $env:BRANCH
+                  inputs = @{ segundos = "2000" }
+              } | ConvertTo-Json
+
+              try {
+                  Invoke-RestMethod `
+                      -Uri "https://api.github.com/repos/$env:REPO/actions/workflows/anydesk.yml/dispatches" `
+                      -Method POST `
+                      -Headers $headers `
+                      -Body $body `
+                      -ContentType "application/json"
+                  Write-Host ">>> Novo ciclo iniciado! Veja o novo ID na proxima execucao. <<<"
+              } catch {
+                  Write-Host "Erro ao reiniciar: $_"
+              }
+
+          } else {
+              Write-Host ">>> Usuario externo - Tempo: $env:SEGUNDOS segundos <<<"
+              Write-Host ""
+              $total = [int]$env:SEGUNDOS
+              $fim   = (Get-Date).AddSeconds($total)
+              while ((Get-Date) -lt $fim) {
+                  $resta = [int]($fim - (Get-Date)).TotalSeconds
+                  Write-Host "[$(Get-Date -Format T)] VM ativa - restam ${resta}s | ID: $env:ANYDESK_ID"
+                  Start-Sleep -Seconds 30
+              }
+              Write-Host "Tempo encerrado."
+          }
